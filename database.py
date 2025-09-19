@@ -155,7 +155,7 @@ class Database:
     def _get_insert_query(self) -> str:
         """Get insert query."""
         return """
-            INSERT INTO market_metrics_fast (
+            INSERT INTO link_metrics_raw (
                 coin, mark_price, oracle_price, mid_price,
                 best_bid, best_ask, spread, spread_pct,
                 funding_rate_pct, open_interest, volume_24h,
@@ -214,7 +214,7 @@ class Database:
             with self._get_connection() as conn:
                 with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
                     cursor.execute("""
-                        SELECT * FROM market_metrics_fast
+                        SELECT * FROM link_metrics_raw
                         WHERE coin = %s
                         ORDER BY timestamp DESC
                         LIMIT %s
@@ -244,7 +244,7 @@ class Database:
                             MAX(timestamp) as newest_record,
                             AVG(ws_latency_ms) as avg_ws_latency,
                             AVG(node_latency_ms) as avg_node_latency
-                        FROM market_metrics_fast
+                        FROM link_metrics_raw
                         WHERE timestamp > NOW() - INTERVAL '1 hour'
                     """)
                     

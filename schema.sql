@@ -1,5 +1,5 @@
--- Market metrics table
-CREATE TABLE IF NOT EXISTS market_metrics_fast (
+-- LINK metrics raw data table
+CREATE TABLE IF NOT EXISTS link_metrics_raw (
     id BIGSERIAL PRIMARY KEY,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     coin VARCHAR(20) NOT NULL,
@@ -47,5 +47,5 @@ CREATE TABLE IF NOT EXISTS market_metrics_fast (
 );
 
 -- Indexes for performance
-CREATE INDEX IF NOT EXISTS idx_timestamp ON market_metrics_fast (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_coin_timestamp ON market_metrics_fast (coin, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_timestamp ON link_metrics_raw (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_coin_timestamp ON link_metrics_raw (coin, timestamp DESC);

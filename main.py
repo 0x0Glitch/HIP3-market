@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from config import Config, MarketConfig
 from database import Database
 from market_data import MarketDataFetcher
-from websocket_client import OrderBookWebSocketClient, OptimizedLiquidityCalculator
+from websocket_client import OptimizedWebSocketClient, OptimizedLiquidityCalculator
 
 # Configure logging
 def setup_logging(config: Config):
@@ -46,7 +46,7 @@ class MarketMonitor:
             config.request_timeout_ms
         )
         
-        self.ws_client = OrderBookWebSocketClient(
+        self.ws_client = OptimizedWebSocketClient(
             config.orderbook_ws_url,
             config.ws_reconnect_delay,
             config.ws_max_reconnect_delay
@@ -58,6 +58,10 @@ class MarketMonitor:
         self.metrics_buffer: List[Dict[str, Any]] = []
         self.last_flush_time = time.time()
         self.iteration_count = 0
+        
+        # Single market processing for fresh data every 2s
+        self.current_market_index = 0
+        self.use_single_market_mode = len(self.config.markets) == 1  # Enable single market mode
         
         # Performance tracking
         self.performance_stats = {
@@ -91,8 +95,11 @@ class MarketMonitor:
             logger.warning("WebSocket client failed to start, will retry during monitoring")
         
         logger.info(f"✓ Database connected with {self.config.database_pool_size} connections")
-        logger.info(f"✓ Will monitor {len(self.config.markets)} markets: {[m.symbol for m in self.config.markets]}")
+        logger.info(f"✓ Will monitor {len(self.config.markets)} market(s): {[m.symbol for m in self.config.markets]}")
         logger.info(f"✓ Monitoring interval: {self.config.monitoring_interval}s")
+        logger.info(f"✓ Processing mode: Single-Market (LIVE {self.config.markets[0].symbol} data every {self.config.monitoring_interval}s)")
+        logger.info(f"✓ Data freshness: Always fetch live data (no caching)")
+        logger.info(f"✓ Database insertion: Immediate (no batching for live data)")
         logger.info(f"✓ Max concurrent requests: {self.config.max_concurrent_requests}")
         logger.info(f"✓ Batch insert enabled: {self.config.enable_batch_insert}")
         
@@ -111,19 +118,34 @@ class MarketMonitor:
         """Collect orderbook data from WebSocket with concurrency control."""
         async with self.request_semaphore:
             try:
-                snapshot = await self.ws_client.fetch_l4_snapshot(market.symbol)
+                ws_start_time = time.time()
+                snapshot = await self.ws_client.fetch_l4_snapshot(market.symbol, timeout=1.5, force_fresh=True)  # Always get live data
+                ws_latency_ms = (time.time() - ws_start_time) * 1000
+                
                 if snapshot:
                     # Use executor for CPU-intensive depth calculation
                     loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(
+                    orderbook_metrics = await loop.run_in_executor(
                         self.executor,
                         self.depth_calculator.calculate_liquidity_depth,
                         snapshot,
                         market
                     )
+                    
+                    # Add WebSocket latency to metrics
+                    if orderbook_metrics:
+                        orderbook_metrics["ws_latency_ms"] = int(ws_latency_ms)
+                    
+                    return orderbook_metrics
+                else:
+                    # Log WebSocket health when no data received
+                    health = self.ws_client.get_connection_health()
+                    if not health["is_healthy"]:
+                        logger.debug(f"WebSocket unhealthy for {market.symbol}: {health}")
+                
                 return None
             except Exception as e:
-                logger.warning(f"OrderBook error for {market.symbol}: {e}")
+                logger.debug(f"OrderBook error for {market.symbol}: {e}")
                 self.performance_stats["market_stats"].setdefault(market.symbol, {})["ws_errors"] = \
                     self.performance_stats["market_stats"][market.symbol].get("ws_errors", 0) + 1
                 return None
@@ -198,43 +220,28 @@ class MarketMonitor:
             self.metrics_buffer.clear()  # Clear buffer to prevent memory buildup
     
     async def run_monitoring_cycle(self):
-        """Run a single monitoring cycle with performance optimizations."""
+        """Run monitoring cycle with fresh LINK data every 2s."""
         cycle_start = time.time()
         self.iteration_count += 1
         
-        # Process all markets concurrently
-        tasks = [self.process_market(market) for market in self.config.markets]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Process the single market (LINK)
+        market = self.config.markets[0]  # Only LINK
         
-        # Collect valid results
-        valid_results = []
-        for i, result in enumerate(results):
-            market = self.config.markets[i]
-            
-            if isinstance(result, Exception):
-                logger.error(f"Exception processing {market.symbol}: {result}")
-                self.performance_stats["failed_iterations"] += 1
-                continue
-                
-            if result:
-                valid_results.append(result)
+        # Process single market
+        result = await self.process_market(market)
         
-        # Add to buffer or insert immediately
-        if self.config.enable_batch_insert:
-            self.metrics_buffer.extend(valid_results)
-            
-            # Flush buffer periodically or when full
-            should_flush = (
-                len(self.metrics_buffer) >= self.config.batch_insert_size or
-                (time.time() - self.last_flush_time) >= self.config.batch_flush_interval
-            )
-            
-            if should_flush:
-                await self.flush_metrics_buffer()
+        if isinstance(result, Exception):
+            logger.error(f"Exception processing {market.symbol}: {result}")
+            self.performance_stats["failed_iterations"] += 1
+            valid_results = []
+        elif result:
+            valid_results = [result]
+            # Insert immediately for fresh data - NO BATCHING
+            await self.db.insert_market_metrics(result)
+            logger.info(f"✓ Live {market.symbol} data inserted (ws_latency: {result.get('ws_latency_ms', 0)}ms)")
         else:
-            # Insert immediately
-            for metrics in valid_results:
-                await self.db.insert_market_metrics(metrics)
+            logger.warning(f"No data received for {market.symbol}")
+            valid_results = []
         
         # Update performance stats
         cycle_time = time.time() - cycle_start
@@ -247,9 +254,14 @@ class MarketMonitor:
         if self.iteration_count % 10 == 0:
             avg_latency = self.performance_stats["total_latency_ms"] / max(1, self.performance_stats["total_iterations"])
             success_rate = (self.performance_stats["successful_iterations"] / max(1, self.performance_stats["total_iterations"])) * 100
-            logger.info(f"Performance: {self.iteration_count} cycles, avg latency: {avg_latency:.1f}ms, success: {success_rate:.1f}%")
+            
+            # Include WebSocket health in performance summary
+            ws_health = self.ws_client.get_connection_health()
+            health_str = f"WS: {'✓' if ws_health['is_healthy'] else '✗'} (reconnects: {ws_health['total_reconnects']}, last_msg: {ws_health['last_message_age_seconds']:.1f}s ago)"
+            
+            logger.info(f"Performance [Single-Market]: {self.iteration_count} cycles, avg latency: {avg_latency:.1f}ms, success: {success_rate:.1f}%, {health_str}")
         
-        logger.info(f"Cycle {self.iteration_count} completed in {cycle_time:.3f}s - {len(valid_results)}/{len(results)} markets successful")
+        logger.info(f"Cycle {self.iteration_count} completed in {cycle_time:.3f}s - {market.symbol} {'✓' if valid_results else '✗'}")
     
     async def shutdown(self):
         """Graceful shutdown with cleanup."""
@@ -265,6 +277,7 @@ class MarketMonitor:
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=True)
         
+        await self.ws_client.close()
         await self.db.disconnect()
         logger.info("✓ Shutdown complete")
     
