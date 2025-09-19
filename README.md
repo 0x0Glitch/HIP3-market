@@ -1,15 +1,18 @@
-# LINK Perpetual Market Monitoring System
+# LINK Perpetual Market Monitoring System (v1.1.0)
 
-A comprehensive monitoring system for Hyperliquid LINK perpetual market that tracks real-time market metrics and liquidity depth with sub-second latency.
+An optimized monitoring system for Hyperliquid LINK perpetual market that tracks real-time market metrics and liquidity depth with persistent connections and data freshness guarantees.
 
 ## Features
 
 - **Real-time Market Data**: Fetches mark price, oracle price, funding rate, open interest, and 24h volume
 - **Liquidity Depth Analysis**: Calculates bid/ask depth at 5%, 10%, and 25% price levels from L4 orderbook
+- **Persistent WebSocket Connection**: Maintains persistent WebSocket connection with automatic reconnection
+- **Data Freshness Guarantee**: Ensures data is fresh based on monitoring interval (configurable)
+- **Connection Pooling**: PostgreSQL connection pooling for better performance and reliability
 - **Dual Data Sources**: Uses local Hyperliquid node for low latency with public API fallback
 - **Robust Error Handling**: Never terminates automatically, only stops on Ctrl+C
 - **PostgreSQL Storage**: Stores all metrics with timestamps for historical analysis
-- **WebSocket Integration**: Real-time L4 orderbook data via local orderbook server
+- **Industry Standards**: SQL schema in separate file, proper module structure, type hints
 
 ## Architecture
 
@@ -66,7 +69,7 @@ PUBLIC_INFO_URL=https://api.hyperliquid.xyz/info
 ORDERBOOK_WS_URL=ws://localhost:8000
 
 # Monitoring Configuration
-MONITORING_INTERVAL=60  # seconds
+MONITORING_INTERVAL=2.0  # seconds (supports float for sub-second intervals)
 COIN_SYMBOL=LINK
 ```
 

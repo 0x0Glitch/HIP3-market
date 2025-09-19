@@ -1,346 +1,338 @@
-"""Multi-market monitoring system with performance optimizations."""
-
 import asyncio
 import logging
 import signal
 import sys
-import time
-from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, Optional
 
-from config import Config, MarketConfig
+from config import Config
 from database import Database
 from market_data import MarketDataFetcher
-from websocket_client import OptimizedWebSocketClient, OptimizedLiquidityCalculator
+from websocket_persistent import PersistentWebSocketClient, LiquidityDepthCalculator
 
 # Configure logging
-def setup_logging(config: Config):
-    """Setup logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Reduce verbosity of some loggers
-    logging.getLogger('websockets').setLevel(logging.WARNING)
-    logging.getLogger('asyncio').setLevel(logging.WARNING)
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-
-class MarketMonitor:
-    """High-performance multi-market monitoring system."""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.db = Database(
-            config.database_url,
-            config.database_pool_size,
-            config.database_max_overflow
-        )
-        
+class LinkMarketMonitor:
+    def __init__(self):
+        self.config = Config()
+        self.db = Database(self.config.database_url, min_connections=2, max_connections=10)
         self.market_fetcher = MarketDataFetcher(
-            config.node_info_url,
-            config.public_info_url,
-            config.request_timeout_ms
+            self.config.NODE_INFO_URL,
+            self.config.PUBLIC_INFO_URL
         )
-        
-        self.ws_client = OptimizedWebSocketClient(
-            config.orderbook_ws_url,
-            config.ws_reconnect_delay,
-            config.ws_max_reconnect_delay
+        self.orderbook_client = PersistentWebSocketClient(
+            self.config.ORDERBOOK_WS_URL,
+            self.config.COIN_SYMBOL,
+            n_levels=100
         )
-        
-        self.depth_calculator = OptimizedLiquidityCalculator()
-        
+        self.depth_calculator = LiquidityDepthCalculator()
         self.running = True
-        self.metrics_buffer: List[Dict[str, Any]] = []
-        self.last_flush_time = time.time()
-        self.iteration_count = 0
-        
-        # Single market processing for fresh data every 2s
-        self.current_market_index = 0
-        self.use_single_market_mode = len(self.config.markets) == 1  # Enable single market mode
-        
-        # Performance tracking
-        self.performance_stats = {
-            "total_iterations": 0,
-            "successful_iterations": 0,
-            "failed_iterations": 0,
-            "total_latency_ms": 0,
-            "market_stats": {}
-        }
-        
-        # Threading executor for CPU-intensive tasks
-        self.executor = ThreadPoolExecutor(
-            max_workers=config.max_concurrent_markets,
-            thread_name_prefix="market_processor"
-        )
-        
-        # Semaphore to limit concurrent requests
-        self.request_semaphore = asyncio.Semaphore(config.max_concurrent_requests)
-        
+        # Calculate max age for data freshness (half of monitoring interval)
+        self.max_data_age = self.config.MONITORING_INTERVAL / 2.0
+
     async def setup(self):
-        """Initialize connections and validate configuration."""
-        logger.info("Setting up high-performance market monitor...")
-        
-        self.config.validate()
-        
-        if not await self.db.connect_async():
-            raise RuntimeError("Database connection failed")
-        
-        # Start WebSocket client
-        if not await self.ws_client.start():
-            logger.warning("WebSocket client failed to start, will retry during monitoring")
-        
-        logger.info(f"✓ Database connected with {self.config.database_pool_size} connections")
-        logger.info(f"✓ Will monitor {len(self.config.markets)} market(s): {[m.symbol for m in self.config.markets]}")
-        logger.info(f"✓ Monitoring interval: {self.config.monitoring_interval}s")
-        logger.info(f"✓ Processing mode: Single-Market (LIVE {self.config.markets[0].symbol} data every {self.config.monitoring_interval}s)")
-        logger.info(f"✓ Data freshness: Always fetch live data (no caching)")
-        logger.info(f"✓ Database insertion: Immediate (no batching for live data)")
-        logger.info(f"✓ Max concurrent requests: {self.config.max_concurrent_requests}")
-        logger.info(f"✓ Batch insert enabled: {self.config.enable_batch_insert}")
-        
-    async def collect_market_data(self, market: MarketConfig) -> Optional[Dict[str, Any]]:
-        """Collect market data from node API with concurrency control."""
-        async with self.request_semaphore:
-            try:
-                return await self.market_fetcher.fetch_market_data(market.symbol)
-            except Exception as e:
-                logger.warning(f"Market data error for {market.symbol}: {e}")
-                self.performance_stats["market_stats"].setdefault(market.symbol, {})["api_errors"] = \
-                    self.performance_stats["market_stats"][market.symbol].get("api_errors", 0) + 1
-                return None
-    
-    async def collect_orderbook_data(self, market: MarketConfig) -> Optional[Dict[str, Any]]:
-        """Collect orderbook data from WebSocket with concurrency control."""
-        async with self.request_semaphore:
-            try:
-                ws_start_time = time.time()
-                snapshot = await self.ws_client.fetch_l4_snapshot(market.symbol, timeout=1.5, force_fresh=True)  # Always get live data
-                ws_latency_ms = (time.time() - ws_start_time) * 1000
-                
-                if snapshot:
-                    # Use executor for CPU-intensive depth calculation
-                    loop = asyncio.get_event_loop()
-                    orderbook_metrics = await loop.run_in_executor(
-                        self.executor,
-                        self.depth_calculator.calculate_liquidity_depth,
-                        snapshot,
-                        market
-                    )
-                    
-                    # Add WebSocket latency to metrics
-                    if orderbook_metrics:
-                        orderbook_metrics["ws_latency_ms"] = int(ws_latency_ms)
-                    
-                    return orderbook_metrics
-                else:
-                    # Log WebSocket health when no data received
-                    health = self.ws_client.get_connection_health()
-                    if not health["is_healthy"]:
-                        logger.debug(f"WebSocket unhealthy for {market.symbol}: {health}")
-                
-                return None
-            except Exception as e:
-                logger.debug(f"OrderBook error for {market.symbol}: {e}")
-                self.performance_stats["market_stats"].setdefault(market.symbol, {})["ws_errors"] = \
-                    self.performance_stats["market_stats"][market.symbol].get("ws_errors", 0) + 1
-                return None
-    
-    async def process_market(self, market: MarketConfig) -> Optional[Dict[str, Any]]:
-        """Process a single market with performance tracking."""
-        start_time = time.time()
-        
+        """Initialize connections."""
+        logger.info("Setting up LINK market monitor...")
+
+        # Connect to database
         try:
-            # Fetch both data sources concurrently
-            market_task = asyncio.create_task(self.collect_market_data(market))
-            orderbook_task = asyncio.create_task(self.collect_orderbook_data(market))
-            
-            market_data, orderbook_data = await asyncio.gather(
-                market_task, orderbook_task, return_exceptions=True
+            db_success = self.db.connect()
+            if not db_success:
+                logger.error("Failed to connect to database, will retry during operation")
+        except Exception as e:
+            logger.error(f"Database connection error: {e}, will retry during operation")
+
+        # Connect persistent WebSocket
+        try:
+            connected = await self.orderbook_client.connect()
+            if connected:
+                logger.info("OrderBook WebSocket connected successfully")
+            else:
+                logger.warning("OrderBook WebSocket connection failed, will retry during operation")
+        except Exception as e:
+            logger.error(f"Error connecting to OrderBook WebSocket: {e}")
+
+        logger.info("Setup complete")
+
+    async def teardown(self):
+        """Clean up connections."""
+        logger.info("Shutting down LINK market monitor...")
+
+        # Close persistent WebSocket connection
+        if self.orderbook_client:
+            try:
+                await self.orderbook_client.close()
+            except Exception as e:
+                logger.error(f"Error closing orderbook client: {e}")
+
+        try:
+            self.db.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting database: {e}")
+
+        logger.info("Shutdown complete")
+
+    async def collect_market_data(self) -> Optional[Dict[str, Any]]:
+        """Collect market data from node /info endpoint."""
+        try:
+            market_data = await self.market_fetcher.get_meta_and_asset_ctxs(
+                self.config.COIN_SYMBOL
             )
-            
-            # Handle exceptions
-            if isinstance(market_data, Exception):
-                logger.error(f"Market data exception for {market.symbol}: {market_data}")
-                market_data = None
-            if isinstance(orderbook_data, Exception):
-                logger.error(f"OrderBook exception for {market.symbol}: {orderbook_data}")
-                orderbook_data = None
-            
+
             if not market_data:
-                logger.warning(f"No market data for {market.symbol}, skipping insertion")
+                logger.error("Failed to fetch market data")
+                return None
+
+            logger.debug(f"Market data: {market_data}")
+            return market_data
+
+        except Exception as e:
+            logger.error(f"Error collecting market data: {e}")
+            return None
+
+    async def collect_orderbook_data(self) -> Optional[Dict[str, Any]]:
+        """Collect orderbook data and calculate liquidity depth."""
+        try:
+            # Ensure connection is active
+            if not await self.orderbook_client.ensure_connected():
+                logger.warning("Failed to ensure WebSocket connection")
                 return None
             
+            # Get fresh snapshot with data freshness requirement
+            # Use max_age to ensure data is fresh (half of monitoring interval)
+            snapshot = self.orderbook_client.get_snapshot(max_age_seconds=self.max_data_age)
+            
+            # If snapshot is too old, try to get a fresh one
+            if not snapshot:
+                logger.info("Requesting fresh orderbook snapshot...")
+                snapshot = await self.orderbook_client.get_fresh_snapshot(timeout=min(5.0, self.max_data_age))
+
+            if not snapshot:
+                logger.warning("No fresh orderbook snapshot available")
+                return None
+
+            # Analyze orderbook
+            orderbook_metrics = self.depth_calculator.analyze_orderbook(snapshot, self.config.COIN_SYMBOL)
+
+            # Add connection stats
+            stats = self.orderbook_client.get_stats()
+            if stats.get('last_snapshot_age') is not None:
+                orderbook_metrics['snapshot_age_ms'] = int(stats['last_snapshot_age'] * 1000)
+            
+            logger.debug(f"Orderbook metrics: {orderbook_metrics}")
+            return orderbook_metrics
+
+        except Exception as e:
+            logger.error(f"Error collecting orderbook data: {e}, will attempt reconnection")
+            # Try to reconnect for next iteration
+            asyncio.create_task(self.orderbook_client.connect())
+            return None
+
+    async def monitor_iteration(self):
+        """Single monitoring iteration."""
+        try:
+            logger.info(f"Starting monitoring iteration at {datetime.now(timezone.utc).isoformat()}")
+
+            # Collect market data
+            market_data = await self.collect_market_data()
+            if not market_data:
+                logger.warning("Skipping iteration due to missing market data")
+                return
+
+            # Collect orderbook data
+            orderbook_data = await self.collect_orderbook_data()
+
             # Merge data
             metrics = {**market_data}
             if orderbook_data:
-                for key, value in orderbook_data.items():
-                    if value is not None:
-                        metrics[key] = value
-            
-            # Track performance
-            processing_time = (time.time() - start_time) * 1000
-            self.performance_stats["market_stats"].setdefault(market.symbol, {})["avg_latency_ms"] = processing_time
-            
-            return metrics
-            
-        except Exception as e:
-            logger.error(f"Error processing {market.symbol}: {e}")
-            self.performance_stats["market_stats"].setdefault(market.symbol, {})["processing_errors"] = \
-                self.performance_stats["market_stats"][market.symbol].get("processing_errors", 0) + 1
-            return None
-    
-    async def flush_metrics_buffer(self):
-        """Flush accumulated metrics to database using batch insert."""
-        if not self.metrics_buffer:
-            return
-            
-        try:
-            if self.config.enable_batch_insert and len(self.metrics_buffer) > 1:
-                success = await self.db.batch_insert_metrics(self.metrics_buffer)
-                if success:
-                    logger.info(f"✓ Batch inserted {len(self.metrics_buffer)} metrics")
-                else:
-                    logger.warning(f"Batch insert failed for {len(self.metrics_buffer)} metrics")
+                # Only override mid_price from orderbook if it exists and market data doesn't have it
+                if orderbook_data.get('mid_price') and not metrics.get('mid_price'):
+                    metrics['mid_price'] = orderbook_data['mid_price']
+
+                # Always use orderbook data for spread and depth metrics
+                for key in ['best_bid', 'best_ask', 'spread', 'spread_pct', 'mid_price',
+                           'bid_count', 'ask_count', 'total_bids', 'total_asks', 'orderbook_levels']:
+                    if key in orderbook_data:
+                        metrics[key] = orderbook_data[key]
+
+                # Map depth metrics with correct database column names
+                if 'depth_5_pct' in orderbook_data:
+                    metrics['total_depth_5pct'] = orderbook_data['depth_5_pct']
+                    # Also store individual bid/ask depth for database
+                    metrics['bid_depth_5pct'] = orderbook_data.get('bid_depth_5pct', 0)
+                    metrics['ask_depth_5pct'] = orderbook_data.get('ask_depth_5pct', 0)
+
+                if 'depth_10_pct' in orderbook_data:
+                    metrics['total_depth_10pct'] = orderbook_data['depth_10_pct']
+                    metrics['bid_depth_10pct'] = orderbook_data.get('bid_depth_10pct', 0)
+                    metrics['ask_depth_10pct'] = orderbook_data.get('ask_depth_10pct', 0)
+
+                if 'depth_25_pct' in orderbook_data:
+                    metrics['total_depth_25pct'] = orderbook_data['depth_25_pct']
+                    metrics['bid_depth_25pct'] = orderbook_data.get('bid_depth_25pct', 0)
+                    metrics['ask_depth_25pct'] = orderbook_data.get('ask_depth_25pct', 0)
             else:
-                # Fall back to individual inserts
-                for metrics in self.metrics_buffer:
-                    await self.db.insert_market_metrics(metrics)
-                logger.info(f"✓ Individual inserted {len(self.metrics_buffer)} metrics")
-            
-            self.metrics_buffer.clear()
-            self.last_flush_time = time.time()
-            
+                logger.warning("No orderbook data available for this iteration")
+
+            # Log summary with proper formatting
+            def format_value(val, prefix='', suffix='', decimals=2):
+                if val is None or val == 'N/A':
+                    return 'N/A'
+                try:
+                    if isinstance(val, (int, float)):
+                        if decimals is not None:
+                            return f"{prefix}{val:,.{decimals}f}{suffix}"
+                        else:
+                            return f"{prefix}{val:,}{suffix}"
+                    return f"{prefix}{val}{suffix}"
+                except:
+                    return 'N/A'
+
+            logger.info(
+                f"LINK Market Summary:\n"
+                f"  Mark Price: {format_value(metrics.get('mark_price'), '$')}\n"
+                f"  Oracle Price: {format_value(metrics.get('oracle_price'), '$')}\n"
+                f"  Mid Price: {format_value(metrics.get('mid_price'), '$')}\n"
+                f"  Spread: {format_value(metrics.get('spread'), '$')} ({format_value(metrics.get('spread_pct'), suffix='%')})\n"
+                f"  Funding Rate: {format_value(metrics.get('funding_rate_pct'), decimals=4, suffix='%')}\n"
+                f"  Open Interest: {format_value(metrics.get('open_interest'), decimals=0)}\n"
+                f"  24h Volume: {format_value(metrics.get('volume_24h'), '$', decimals=0)}\n"
+                f"  5% Depth: {format_value(metrics.get('total_depth_5pct'), '$', decimals=0)}\n"
+                f"  10% Depth: {format_value(metrics.get('total_depth_10pct'), '$', decimals=0)}\n"
+                f"  25% Depth: {format_value(metrics.get('total_depth_25pct'), '$', decimals=0)}"
+            )
+
+            # Store in database
+            try:
+                success = self.db.insert_market_metrics(metrics)
+                if not success:
+                    logger.warning("Failed to insert metrics to database, will retry next iteration")
+            except Exception as e:
+                logger.error(f"Database insert error: {e}, will retry next iteration")
+
         except Exception as e:
-            logger.error(f"Error flushing metrics: {e}")
-            self.metrics_buffer.clear()  # Clear buffer to prevent memory buildup
-    
-    async def run_monitoring_cycle(self):
-        """Run monitoring cycle with fresh LINK data every 2s."""
-        cycle_start = time.time()
-        self.iteration_count += 1
-        
-        # Process the single market (LINK)
-        market = self.config.markets[0]  # Only LINK
-        
-        # Process single market
-        result = await self.process_market(market)
-        
-        if isinstance(result, Exception):
-            logger.error(f"Exception processing {market.symbol}: {result}")
-            self.performance_stats["failed_iterations"] += 1
-            valid_results = []
-        elif result:
-            valid_results = [result]
-            # Insert immediately for fresh data - NO BATCHING
-            await self.db.insert_market_metrics(result)
-            logger.info(f"✓ Live {market.symbol} data inserted (ws_latency: {result.get('ws_latency_ms', 0)}ms)")
-        else:
-            logger.warning(f"No data received for {market.symbol}")
-            valid_results = []
-        
-        # Update performance stats
-        cycle_time = time.time() - cycle_start
-        self.performance_stats["total_iterations"] += 1
-        if valid_results:
-            self.performance_stats["successful_iterations"] += 1
-        self.performance_stats["total_latency_ms"] += cycle_time * 1000
-        
-        # Log performance every N iterations
-        if self.iteration_count % 10 == 0:
-            avg_latency = self.performance_stats["total_latency_ms"] / max(1, self.performance_stats["total_iterations"])
-            success_rate = (self.performance_stats["successful_iterations"] / max(1, self.performance_stats["total_iterations"])) * 100
-            
-            # Include WebSocket health in performance summary
-            ws_health = self.ws_client.get_connection_health()
-            health_str = f"WS: {'✓' if ws_health['is_healthy'] else '✗'} (reconnects: {ws_health['total_reconnects']}, last_msg: {ws_health['last_message_age_seconds']:.1f}s ago)"
-            
-            logger.info(f"Performance [Single-Market]: {self.iteration_count} cycles, avg latency: {avg_latency:.1f}ms, success: {success_rate:.1f}%, {health_str}")
-        
-        logger.info(f"Cycle {self.iteration_count} completed in {cycle_time:.3f}s - {market.symbol} {'✓' if valid_results else '✗'}")
-    
-    async def shutdown(self):
-        """Graceful shutdown with cleanup."""
-        logger.info("Shutting down monitor...")
-        self.running = False
-        
-        # Flush any remaining metrics
-        if self.metrics_buffer:
-            logger.info(f"Flushing {len(self.metrics_buffer)} remaining metrics...")
-            await self.flush_metrics_buffer()
-        
-        # Cleanup resources
-        if hasattr(self, 'executor'):
-            self.executor.shutdown(wait=True)
-        
-        await self.ws_client.close()
-        await self.db.disconnect()
-        logger.info("✓ Shutdown complete")
-    
+            logger.error(f"Error in monitoring iteration: {e}")
+            logger.info("Continuing to next iteration despite error...")
+
     async def run(self):
-        """Run the monitoring loop with signal handling."""
-        await self.setup()
-        
-        # Setup signal handlers for graceful shutdown
-        def signal_handler():
-            logger.info("Received shutdown signal")
-            self.running = False
-        
-        if sys.platform != 'win32':
-            loop = asyncio.get_event_loop()
-            for sig in [signal.SIGTERM, signal.SIGINT]:
-                loop.add_signal_handler(sig, signal_handler)
-        
-        logger.info("🚀 Starting high-performance monitoring loop...")
-        
+        """Main monitoring loop."""
+        logger.info("Initializing monitoring system...")
+
+        try:
+            await self.setup()
+        except Exception as e:
+            logger.error(f"Setup error: {e}")
+            logger.info("Continuing with partial setup, will retry connections during operation...")
+
+        iteration_count = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 10
+
         try:
             while self.running:
+                iteration_count += 1
+                logger.info(f"\n=== Monitoring Iteration #{iteration_count} ===")
+
                 try:
-                    await self.run_monitoring_cycle()
-                    
-                    # Sleep with early exit on shutdown
-                    for _ in range(int(self.config.monitoring_interval * 10)):
-                        if not self.running:
-                            break
-                        await asyncio.sleep(0.1)
-                
-                except KeyboardInterrupt:
-                    logger.info("Received keyboard interrupt")
-                    break
+                    await self.monitor_iteration()
+                    consecutive_failures = 0  # Reset failure count on success
+
                 except Exception as e:
-                    logger.error(f"Monitoring cycle error: {e}")
-                    self.performance_stats["failed_iterations"] += 1
-                    await asyncio.sleep(min(self.config.monitoring_interval, 5.0))
-        
+                    consecutive_failures += 1
+                    logger.error(f"Iteration #{iteration_count} failed: {e}")
+
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.warning(
+                            f"Had {consecutive_failures} consecutive failures. "
+                            f"Sleeping for extra 30 seconds before continuing..."
+                        )
+                        await asyncio.sleep(30)
+                        consecutive_failures = 0  # Reset to prevent long delays
+
+                if self.running:  # Check if still running before sleeping
+                    logger.info(f"Waiting {self.config.MONITORING_INTERVAL:.1f} seconds until next iteration...")
+
+                    # Sleep in smaller chunks to allow for graceful shutdown
+                    sleep_duration = self.config.MONITORING_INTERVAL
+                    sleep_increment = 0.1  # Check every 100ms for shutdown
+                    elapsed = 0.0
+                    
+                    while elapsed < sleep_duration and self.running:
+                        await asyncio.sleep(min(sleep_increment, sleep_duration - elapsed))
+                        elapsed += sleep_increment
+
+        except KeyboardInterrupt:
+            logger.info("Received interrupt signal (Ctrl+C)")
+        except Exception as e:
+            logger.error(f"Unexpected error in main loop: {e}")
+            logger.info("This should not terminate the program automatically")
         finally:
-            await self.shutdown()
+            logger.info("Cleaning up and shutting down...")
+            try:
+                await self.teardown()
+            except Exception as e:
+                logger.error(f"Error during teardown: {e}")
+
+    def stop(self):
+        """Stop the monitoring loop."""
+        self.running = False
 
 
 async def main():
-    """Main entry point with enhanced error handling."""
+    """Main entry point."""
+    monitor = None
+
     try:
-        config = Config.from_env()
-        setup_logging(config)
-        
-        monitor = MarketMonitor(config)
+        monitor = LinkMarketMonitor()
+
+        # Setup signal handlers
+        def signal_handler(sig, frame):
+            logger.info(f"Received signal {sig}")
+            if monitor:
+                monitor.stop()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        # Run monitor with error recovery
         await monitor.run()
-    
+
     except Exception as e:
-        logger.error(f"Failed to start monitor: {e}")
-        sys.exit(1)
+        logger.error(f"Critical error in main(): {e}")
+        if monitor:
+            try:
+                await monitor.teardown()
+            except:
+                pass
+        raise
 
 
 if __name__ == "__main__":
     try:
-        # Try to use uvloop for better performance if available
-        import uvloop
-        uvloop.install()
-        logger.info("Using uvloop for enhanced performance")
-    except ImportError:
-        logger.info("uvloop not available, using default event loop")
-    
-    asyncio.run(main())
+        logger.info("=== LINK Perpetual Market Monitoring System ===")
+        logger.info(f"Version: 1.1.0")
+        logger.info(f"Monitoring interval: {Config().MONITORING_INTERVAL:.1f} seconds")
+        logger.info(f"Target coin: {Config().COIN_SYMBOL}")
+        logger.info(f"Node endpoint: {Config().NODE_INFO_URL}")
+        logger.info(f"OrderBook WebSocket: {Config().ORDERBOOK_WS_URL}")
+        logger.info(f"Database: {Config().database_url}")
+        logger.info("")
+        logger.info("Press Ctrl+C to stop the monitoring system")
+        logger.info("System will handle errors gracefully and continue running")
+        logger.info("========================================================")
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("\nMonitoring system stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"\nFatal error: {e}")
+        logger.error("The system should not exit automatically. This may be a critical bug.")
+        sys.exit(1)
+    finally:
+        logger.info("LINK market monitoring system has shut down.")
