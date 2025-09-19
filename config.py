@@ -1,57 +1,31 @@
-"""Configuration for LINK market monitoring system."""
-
 import os
-from typing import Optional
-from urllib.parse import quote_plus
+from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Config:
-    # Database - prefer DATABASE_URL if provided
-    DATABASE_URL = os.getenv("DATABASE_URL")
+    """Simple configuration class."""
     
-    # Fallback individual components
-    DB_HOST = os.getenv("DB_HOST", "localhost")
-    try:
-        DB_PORT = int(os.getenv("DB_PORT", "5432"))
-    except (TypeError, ValueError):
-        DB_PORT = 5432
-    DB_NAME = os.getenv("DB_NAME", "Markets")
-    DB_USER = os.getenv("DB_USER", "postgres")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-    
-    # Node endpoints
-    NODE_INFO_URL = os.getenv("NODE_INFO_URL", "http://localhost:3001/info")
-    PUBLIC_INFO_URL = os.getenv("PUBLIC_INFO_URL", "https://api.hyperliquid.xyz/info")
-    
-    # WebSocket
-    ORDERBOOK_WS_URL = os.getenv("ORDERBOOK_WS_URL", "ws://localhost:8000")
-    
-    # Monitoring
-    try:
-        MONITORING_INTERVAL = int(os.getenv("MONITORING_INTERVAL", "60"))  # seconds
-    except (TypeError, ValueError):
-        MONITORING_INTERVAL = 60
-    COIN_SYMBOL = os.getenv("COIN_SYMBOL", "LINK")
-    
-    # Timeouts and retries
-    REQUEST_TIMEOUT_MS = 250
-    MAX_RETRIES = 3
-    NODE_STALENESS_THRESHOLD_S = 3
-    
-    @property
-    def database_url(self) -> str:
-        """Get PostgreSQL connection URL."""
-        # Use DATABASE_URL if provided, otherwise construct from components
-        if self.DATABASE_URL:
-            return self.DATABASE_URL
-            
-        # Fallback: construct from individual components
-        encoded_password = quote_plus(self.DB_PASSWORD) if self.DB_PASSWORD else ''
-        encoded_user = quote_plus(self.DB_USER) if self.DB_USER else ''
+    def __init__(self):
+        # Essential settings only
+        self.database_url = os.getenv("DATABASE_URL", "")
+        self.orderbook_ws_url = os.getenv("ORDERBOOK_WS_URL", "ws://localhost:8000")
+        self.node_info_url = os.getenv("NODE_INFO_URL", "http://localhost:3001/info")
+        self.monitoring_interval = float(os.getenv("MONITORING_INTERVAL", "2.0"))
         
-        if self.DB_PASSWORD:
-            return f"postgresql://{encoded_user}:{encoded_password}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        else:
-            return f"postgresql://{encoded_user}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        # Load markets
+        markets_env = os.getenv("MARKETS", "LINK")
+        self.markets = [s.strip() for s in markets_env.split(",") if s.strip()]
+        
+        # Fixed defaults
+        self.public_info_url = "https://api.hyperliquid.xyz/info"
+        self.request_timeout_ms = 2500
+    
+    def validate(self):
+        """Validate configuration."""
+        if not self.database_url:
+            raise ValueError("DATABASE_URL is required")
+        if not self.markets:
+            raise ValueError("MARKETS is required")
