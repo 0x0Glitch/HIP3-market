@@ -1,5 +1,5 @@
 -- Market metrics table
-CREATE TABLE IF NOT EXISTS market_metrics (
+CREATE TABLE IF NOT EXISTS market_metrics_fast (
     id BIGSERIAL PRIMARY KEY,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     coin VARCHAR(20) NOT NULL,
