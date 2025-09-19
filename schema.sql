@@ -47,5 +47,5 @@ CREATE TABLE IF NOT EXISTS market_metrics_fast (
 );
 
 -- Indexes for performance
-CREATE INDEX IF NOT EXISTS idx_timestamp ON market_metrics (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_coin_timestamp ON market_metrics (coin, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_timestamp ON market_metrics_fast (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_coin_timestamp ON market_metrics_fast (coin, timestamp DESC);

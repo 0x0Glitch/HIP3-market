@@ -48,13 +48,18 @@ class Database:
                 with conn.cursor() as cursor:
                     cursor.execute(schema)
                     conn.commit()
-                    logger.info("Database schema loaded")
             
+            logger.info("Database schema loaded successfully")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to create connection pool: {e}")
+            logger.error(f"Database connection failed: {e}")
             return False
+    
+    async def connect_async(self) -> bool:
+        """Initialize connection pool asynchronously."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, self.connect)
     
     @contextmanager
     def _get_connection(self):
@@ -150,7 +155,7 @@ class Database:
     def _get_insert_query(self) -> str:
         """Get insert query."""
         return """
-            INSERT INTO market_metrics (
+            INSERT INTO market_metrics_fast (
                 coin, mark_price, oracle_price, mid_price,
                 best_bid, best_ask, spread, spread_pct,
                 funding_rate_pct, open_interest, volume_24h,
@@ -209,7 +214,7 @@ class Database:
             with self._get_connection() as conn:
                 with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
                     cursor.execute("""
-                        SELECT * FROM market_metrics
+                        SELECT * FROM market_metrics_fast
                         WHERE coin = %s
                         ORDER BY timestamp DESC
                         LIMIT %s
@@ -239,7 +244,7 @@ class Database:
                             MAX(timestamp) as newest_record,
                             AVG(ws_latency_ms) as avg_ws_latency,
                             AVG(node_latency_ms) as avg_node_latency
-                        FROM market_metrics
+                        FROM market_metrics_fast
                         WHERE timestamp > NOW() - INTERVAL '1 hour'
                     """)
                     
@@ -256,5 +261,25 @@ class Database:
             self.connection_pool.closeall()
             logger.info("Database connection pool closed")
         
-        self._executor.shutdown(wait=True)
-        logger.info("Database executor shut down")
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            logger.info("Database thread pool executor shutdown")
+    
+    async def disconnect(self):
+        """Close connection pool asynchronously."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._executor, self.close)
+    
+    async def insert_market_metrics(self, metrics: Dict[str, Any]) -> bool:
+        """Insert market metrics asynchronously."""
+        return await self.insert_metric_async(metrics)
+    
+    async def batch_insert_metrics(self, metrics_list: List[Dict[str, Any]]) -> bool:
+        """Batch insert metrics asynchronously."""
+        loop = asyncio.get_event_loop()
+        succeeded, failed = await loop.run_in_executor(
+            self._executor, 
+            self.insert_metrics_batch, 
+            metrics_list
+        )
+        return succeeded > 0

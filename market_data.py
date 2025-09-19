@@ -254,3 +254,7 @@ class MarketDataFetcher:
         except Exception as e:
             logger.error(f"Error normalizing response: {e}")
             return None
+    
+    async def fetch_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch market data for a specific symbol - main entry point."""
+        return await self.get_meta_and_asset_ctxs(symbol)

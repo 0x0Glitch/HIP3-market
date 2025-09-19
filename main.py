@@ -83,8 +83,12 @@ class MarketMonitor:
         
         self.config.validate()
         
-        if not await self.db.connect():
+        if not await self.db.connect_async():
             raise RuntimeError("Database connection failed")
+        
+        # Start WebSocket client
+        if not await self.ws_client.start():
+            logger.warning("WebSocket client failed to start, will retry during monitoring")
         
         logger.info(f"✓ Database connected with {self.config.database_pool_size} connections")
         logger.info(f"✓ Will monitor {len(self.config.markets)} markets: {[m.symbol for m in self.config.markets]}")

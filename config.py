@@ -33,10 +33,17 @@ class Config:
     request_timeout_ms: int = 2500
     database_pool_size: int = 5
     database_max_overflow: int = 10
-    batch_insert: bool = True
-    batch_size: int = 10
-    concurrent_market_fetch: bool = True
+    
+    # Batch processing settings
+    enable_batch_insert: bool = True
+    batch_insert_size: int = 10
+    batch_flush_interval: float = 5.0
+    
+    # Concurrency settings
+    max_concurrent_markets: int = 10
     max_concurrent_requests: int = 5
+    
+    # WebSocket settings
     ws_reconnect_delay: float = 1.0
     ws_max_reconnect_delay: float = 30.0
     
@@ -63,3 +70,8 @@ class Config:
             raise ValueError("DATABASE_URL is required")
         if not self.markets:
             raise ValueError("MARKETS is required")
+    
+    @classmethod
+    def from_env(cls) -> 'Config':
+        """Create configuration from environment variables."""
+        return cls()

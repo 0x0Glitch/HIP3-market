@@ -28,10 +28,20 @@ class OrderBookWebSocketClient:
         self.running = False
         self._connect_lock = asyncio.Lock()
         self._receive_task: Optional[asyncio.Task] = None
+        self._started = False
         
         # Performance metrics
         self.last_message_time: Dict[str, float] = {}
         self.message_count: Dict[str, int] = {}
+    
+    async def start(self) -> bool:
+        """Start the WebSocket client and establish connection."""
+        if self._started:
+            return True
+        
+        self._started = True
+        self.running = True
+        return await self.connect()
         
     async def connect(self) -> bool:
         """Establish WebSocket connection."""
@@ -238,34 +248,42 @@ class OrderBookWebSocketClient:
         # Return latest even if not fresh
         return self.latest_snapshots.get(coin)
     
-    def get_metrics(self, coin: str) -> Dict[str, Any]:
-        """Get performance metrics for a coin."""
-        last_time = self.last_message_time.get(coin)
-        return {
-            "message_count": self.message_count.get(coin, 0),
-            "last_message_age_ms": int((time.time() - last_time) * 1000) if last_time else None,
-            "has_snapshot": coin in self.latest_snapshots
-        }
+    async def fetch_l4_snapshot(self, coin: str, timeout: float = 5.0) -> Optional[Dict]:
+        """Fetch L4 snapshot for a coin with subscription management."""
+        try:
+            # Subscribe if not already subscribed
+            if coin not in self.subscriptions:
+                success = await self.subscribe(coin)
+                if not success:
+                    logger.error(f"Failed to subscribe to {coin}")
+                    return None
+            
+            # Wait for fresh snapshot
+            snapshot = await self.wait_for_snapshot(coin, timeout)
+            if not snapshot:
+                logger.warning(f"No snapshot received for {coin} within {timeout}s")
+                return None
+            
+            return snapshot
+            
+        except Exception as e:
+            logger.error(f"Error fetching L4 snapshot for {coin}: {e}")
+            return None
     
     async def close(self):
         """Close WebSocket connection and cleanup."""
         self.running = False
         
-        if self._receive_task:
+        if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
                 await self._receive_task
             except asyncio.CancelledError:
                 pass
         
-        if self.websocket:
-            try:
-                await self.websocket.close()
-            except Exception as e:
-                logger.error(f"Error closing WebSocket: {e}")
-            finally:
-                self.websocket = None
-        
+        if self.websocket and not self.websocket.closed:
+            await self.websocket.close()
+            
         self.subscriptions.clear()
         self.latest_snapshots.clear()
         logger.info("WebSocket client closed")
@@ -436,3 +454,7 @@ class OptimizedLiquidityCalculator:
             }
         
         return depth
+    
+    def calculate_liquidity_depth(self, snapshot: Dict, market_config) -> Dict[str, Any]:
+        """Calculate liquidity depth for a market - main entry point."""
+        return self.analyze_orderbook(snapshot, market_config.symbol)
