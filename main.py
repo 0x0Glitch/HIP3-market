@@ -119,10 +119,20 @@ class LinkMarketMonitor:
             # Analyze orderbook
             orderbook_metrics = self.depth_calculator.analyze_orderbook(snapshot, self.config.COIN_SYMBOL)
 
-            # Add connection stats
+            # Add connection stats and freshness validation
             stats = self.orderbook_client.get_stats()
-            if stats.get('last_snapshot_age') is not None:
-                orderbook_metrics['snapshot_age_ms'] = int(stats['last_snapshot_age'] * 1000)
+            snapshot_age_seconds = stats.get('last_snapshot_age')
+            
+            if snapshot_age_seconds is not None:
+                orderbook_metrics['snapshot_age_ms'] = int(snapshot_age_seconds * 1000)
+                
+                # Log data freshness for monitoring
+                if snapshot_age_seconds <= self.max_data_age:
+                    logger.info(f"✅ Using FRESH orderbook data (age: {snapshot_age_seconds:.2f}s, max: {self.max_data_age:.1f}s)")
+                else:
+                    logger.warning(f"⚠️  Using STALE orderbook data (age: {snapshot_age_seconds:.2f}s, max: {self.max_data_age:.1f}s)")
+            else:
+                logger.warning("⚠️  No snapshot age information available")
             
             logger.debug(f"Orderbook metrics: {orderbook_metrics}")
             return orderbook_metrics
@@ -163,19 +173,25 @@ class LinkMarketMonitor:
                 # Map depth metrics with correct database column names
                 if 'depth_5_pct' in orderbook_data:
                     metrics['total_depth_5pct'] = orderbook_data['depth_5_pct']
-                    # Also store individual bid/ask depth for database
-                    metrics['bid_depth_5pct'] = orderbook_data.get('bid_depth_5pct', 0)
-                    metrics['ask_depth_5pct'] = orderbook_data.get('ask_depth_5pct', 0)
+                    # Only store individual bid/ask depth if they exist (no default zeros)
+                    if 'bid_depth_5pct' in orderbook_data:
+                        metrics['bid_depth_5pct'] = orderbook_data['bid_depth_5pct']
+                    if 'ask_depth_5pct' in orderbook_data:
+                        metrics['ask_depth_5pct'] = orderbook_data['ask_depth_5pct']
 
                 if 'depth_10_pct' in orderbook_data:
                     metrics['total_depth_10pct'] = orderbook_data['depth_10_pct']
-                    metrics['bid_depth_10pct'] = orderbook_data.get('bid_depth_10pct', 0)
-                    metrics['ask_depth_10pct'] = orderbook_data.get('ask_depth_10pct', 0)
+                    if 'bid_depth_10pct' in orderbook_data:
+                        metrics['bid_depth_10pct'] = orderbook_data['bid_depth_10pct']
+                    if 'ask_depth_10pct' in orderbook_data:
+                        metrics['ask_depth_10pct'] = orderbook_data['ask_depth_10pct']
 
                 if 'depth_25_pct' in orderbook_data:
                     metrics['total_depth_25pct'] = orderbook_data['depth_25_pct']
-                    metrics['bid_depth_25pct'] = orderbook_data.get('bid_depth_25pct', 0)
-                    metrics['ask_depth_25pct'] = orderbook_data.get('ask_depth_25pct', 0)
+                    if 'bid_depth_25pct' in orderbook_data:
+                        metrics['bid_depth_25pct'] = orderbook_data['bid_depth_25pct']
+                    if 'ask_depth_25pct' in orderbook_data:
+                        metrics['ask_depth_25pct'] = orderbook_data['ask_depth_25pct']
             else:
                 logger.warning("No orderbook data available for this iteration")
 
@@ -207,6 +223,11 @@ class LinkMarketMonitor:
                 f"  25% Depth: {format_value(metrics.get('total_depth_25pct'), '$', decimals=0)}"
             )
 
+
+            if not self._validate_metrics(metrics):
+                logger.warning("Skipping database insertion - metrics validation failed, waiting for complete data")
+                return
+
             # Store in database
             try:
                 success = self.db.insert_market_metrics(metrics)
@@ -218,6 +239,71 @@ class LinkMarketMonitor:
         except Exception as e:
             logger.error(f"Error in monitoring iteration: {e}")
             logger.info("Continuing to next iteration despite error...")
+
+    def _validate_metrics(self, metrics: Dict[str, Any]) -> bool:
+        """
+        Validate that essential metrics are not None/null before database insertion.
+        Returns True if metrics are valid for database insertion, False otherwise.
+        """
+        # Required fields that must not be None
+        required_fields = [
+            'coin',           # Always required
+            'mid_price',      # Essential for calculations
+            'best_bid',       # Core orderbook data
+            'best_ask',       # Core orderbook data
+        ]
+        
+        # Check required fields
+        for field in required_fields:
+            value = metrics.get(field)
+            if value is None or (isinstance(value, str) and value.strip() == ''):
+                logger.warning(f"Required field '{field}' is None/empty, skipping database insertion")
+                return False
+        
+        # Important depth fields - if any orderbook data is present, these should be valid
+        critical_depth_fields = [
+            'total_depth_5pct'  # At minimum, we need 5% depth
+        ]
+        
+        # Check if we have orderbook data but critical depth fields are missing
+        has_orderbook_data = any([
+            metrics.get('best_bid') is not None,
+            metrics.get('best_ask') is not None,
+            metrics.get('orderbook_levels', 0) > 0
+        ])
+        
+        if has_orderbook_data:
+            # Check critical depth fields
+            missing_critical_fields = [field for field in critical_depth_fields if metrics.get(field) is None]
+            if missing_critical_fields:
+                logger.warning(f"Orderbook data present but critical depth fields missing: {missing_critical_fields}")
+                return False
+            
+            # Also check that depth values are not zero (which indicates calculation failure)
+            for field in critical_depth_fields:
+                value = metrics.get(field)
+                if value is not None and value == 0:
+                    logger.warning(f"Depth field '{field}' is zero - indicates calculation failure")
+                    return False
+        
+        # Validate numeric fields are actually numeric
+        numeric_fields = [
+            'mark_price', 'oracle_price', 'mid_price', 'best_bid', 'best_ask',
+            'spread', 'spread_pct', 'funding_rate_pct', 'open_interest', 'volume_24h',
+            'total_depth_5pct', 'total_depth_10pct', 'total_depth_25pct'
+        ]
+        
+        for field in numeric_fields:
+            value = metrics.get(field)
+            if value is not None:
+                try:
+                    float(value)
+                except (ValueError, TypeError):
+                    logger.warning(f"Field '{field}' has invalid numeric value: {value}")
+                    return False
+        
+        logger.debug("Metrics validation passed - all essential fields present and valid")
+        return True
 
     async def run(self):
         """Main monitoring loop."""
