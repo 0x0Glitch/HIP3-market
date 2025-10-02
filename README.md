@@ -61,7 +61,7 @@ Edit `.env` with your database connection details:
 # Database Configuration (recommended: use DATABASE_URL)
 DATABASE_URL=postgresql://postgres:your_password_here@localhost:5432/link_market_monitoring
 
-# Node Configuration  
+# Node Configuration
 NODE_INFO_URL=http://localhost:3001/info
 PUBLIC_INFO_URL=https://api.hyperliquid.xyz/info
 
@@ -74,6 +74,7 @@ COIN_SYMBOL=LINK
 ```
 
 **Database Configuration Options:**
+
 - **Option 1 (Recommended)**: Use `DATABASE_URL` - single connection string
 - **Option 2**: Use individual components (`DB_HOST`, `DB_PORT`, etc.) - see `.env.example` for details
 
@@ -90,10 +91,12 @@ The schema will be created automatically when you first run the application.
 ### 5. Start Hyperliquid Infrastructure
 
 Ensure you have:
+
 1. **Hyperliquid Node**: Running on port 3001 with `/info` endpoint available
 2. **OrderBook Server**: Running on port 8000 with L4 book WebSocket support
 
 Start the orderbook server:
+
 ```bash
 cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000
 ```
@@ -107,6 +110,7 @@ python main.py
 ```
 
 The system will:
+
 1. Connect to database and create schema if needed
 2. Connect to node `/info` endpoint and orderbook WebSocket
 3. Begin monitoring every 60 seconds (configurable)
@@ -142,34 +146,34 @@ CREATE TABLE market_metrics (
     id SERIAL PRIMARY KEY,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     coin VARCHAR(20) NOT NULL,
-    
+
     -- Prices
     mark_price DECIMAL(20, 8),
-    oracle_price DECIMAL(20, 8), 
+    oracle_price DECIMAL(20, 8),
     mid_price DECIMAL(20, 8),
-    
+
     -- Spread
     best_bid DECIMAL(20, 8),
     best_ask DECIMAL(20, 8),
     spread DECIMAL(20, 8),
     spread_pct DECIMAL(10, 6),
-    
+
     -- Market metrics
     funding_rate DECIMAL(12, 10),
     open_interest DECIMAL(20, 8),
     volume_24h DECIMAL(20, 8),
-    
+
     -- Liquidity depth (5%, 10%, 25%)
     bid_depth_5pct DECIMAL(20, 8),
     ask_depth_5pct DECIMAL(20, 8),
     total_depth_5pct DECIMAL(20, 8),
     -- ... and 10%, 25% variants
-    
+
     -- Premium/Impact prices
     premium DECIMAL(12, 10),
     impact_px_bid DECIMAL(20, 8),
     impact_px_ask DECIMAL(20, 8),
-    
+
     -- Metadata
     node_latency_ms INTEGER,
     orderbook_levels INTEGER
@@ -193,6 +197,7 @@ Only `Ctrl+C` (SIGINT) or `kill` (SIGTERM) will stop the system.
 Default: 60 seconds (configurable via `MONITORING_INTERVAL`)
 
 Each iteration:
+
 1. Fetches market data from `/info` endpoint (local node or public API)
 2. Fetches L4 orderbook snapshot via WebSocket
 3. Calculates liquidity depth at 5%, 10%, 25% levels
@@ -203,12 +208,14 @@ Each iteration:
 
 ### Common Issues
 
-1. **Database connection fails**: 
+1. **Database connection fails**:
+
    - Check PostgreSQL is running
    - Verify connection string in `.env`
    - Check database permissions
 
 2. **OrderBook WebSocket fails**:
+
    - Ensure orderbook server is running on port 8000
    - Check if Hyperliquid node is writing L4 data
    - Monitor will continue with market data only
@@ -221,6 +228,7 @@ Each iteration:
 ### Logs
 
 The system provides detailed logging:
+
 - **INFO**: Normal operation, market summaries
 - **WARNING**: Non-critical issues, fallbacks
 - **ERROR**: Failed operations, will retry
