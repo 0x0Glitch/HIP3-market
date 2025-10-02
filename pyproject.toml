@@ -1,7 +1,7 @@
 [project]
-name = "link-market-monitor"
-version = "1.1.0"
-description = "Optimized Hyperliquid LINK perpetual market monitoring system with persistent connections"
+name = "multi-market-monitor"
+version = "2.0.0"
+description = "Multi-market Hyperliquid perpetual monitoring system with hot-reload and concurrent processing"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -29,7 +29,7 @@ monitoring = [
 ]
 
 [project.scripts]
-link-monitor = "main:main"
+multi-market-monitor = "multi_market_main:main"
 
 [build-system]
 requires = ["hatchling"]

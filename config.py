@@ -39,6 +39,11 @@ class Config:
     def coin_symbol(self) -> str:
         """Backward compatibility - returns first market."""
         return self.target_markets[0] if self.target_markets else "LINK"
+    
+    @property  
+    def COIN_SYMBOL(self) -> str:
+        """Backward compatibility - returns first market."""
+        return self.coin_symbol
 
     # Timeouts and retries
     REQUEST_TIMEOUT_MS = 250

@@ -275,6 +275,10 @@ class PersistentWebSocketClient:
                 self.connection = None
                 logger.info(f"Closed WebSocket connection for {self.coin}")
     
+    async def disconnect(self):
+        """Alias for close() for compatibility."""
+        await self.close()
+    
     def get_stats(self) -> Dict[str, Any]:
         """Get connection statistics."""
         connected = False
