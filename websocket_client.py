@@ -13,6 +13,20 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
+# Import metrics if available
+try:
+    from metrics_market import (
+        WEBSOCKET_RECONNECTIONS,
+        WEBSOCKET_SUBSCRIBE_DURATION,
+        monitor_websocket_operation
+    )
+    METRICS_ENABLED = True
+except ImportError:
+    METRICS_ENABLED = False
+    # Dummy decorator if metrics not available
+    def monitor_websocket_operation(func):
+        return func
+
 
 class WebSocketClient:
     """WebSocket client with optimized subscribe/resubscribe pattern and connection stability."""
@@ -195,6 +209,13 @@ class WebSocketClient:
         if not self.running:
             return
 
+        # Track reconnection in metrics
+        if METRICS_ENABLED:
+            WEBSOCKET_RECONNECTIONS.labels(
+                coin=self.coin, 
+                reason='connection_lost'
+            ).inc()
+
         # Start buffering updates (will be discarded on reconnect with fresh snapshot)
         self._buffering = True
 
@@ -267,6 +288,7 @@ class WebSocketClient:
 
         return self._current_snapshot
 
+    @monitor_websocket_operation
     async def get_fresh_metrics(self) -> Dict[str, Any]:
         """FORCE fresh orderbook metrics by resubscribing - NO CACHE, ALWAYS FRESH."""
         # Ensure connected

@@ -11,6 +11,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Import metrics if available
+try:
+    from metrics_market import (
+        monitor_database_operation,
+        update_database_pool_metrics,
+        DATABASE_INSERT_BATCH_SIZE
+    )
+    METRICS_ENABLED = True
+except ImportError:
+    METRICS_ENABLED = False
+    # Dummy decorator if metrics not available
+    def monitor_database_operation(operation, table):
+        def decorator(func):
+            return func
+        return decorator
+
 def get_table_schema(coin_symbol: str) -> str:
     """Get table schema for a specific coin."""
     table_name = f"{coin_symbol.lower()}_metrics_raw"
@@ -173,6 +189,14 @@ class Database:
 
         # Use market-specific table
         table_name = f"{coin_symbol.lower()}_metrics_raw"
+        
+        # Wrap with metrics monitoring
+        return self._insert_with_metrics(table_name, metrics)
+    
+    @monitor_database_operation('insert', 'market_metrics')
+    def _insert_with_metrics(self, table_name: str, metrics: Dict[str, Any]) -> bool:
+        """Internal method with metrics monitoring."""
+        coin_symbol = metrics.get('coin')
 
         query = f"""
             INSERT INTO market_metrics.{table_name} (
@@ -229,7 +253,12 @@ class Database:
                             )
                         )
                         logger.info(f"Inserted market metrics for {metrics['coin']}")
-                        return True
+                    
+                    # Update pool metrics if enabled
+                    if METRICS_ENABLED and self.pool:
+                        update_database_pool_metrics(self.pool)
+                    
+                    return True
                 finally:
                     self.pool.putconn(conn)
 

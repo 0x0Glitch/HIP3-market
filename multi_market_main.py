@@ -15,6 +15,28 @@ from database import Database
 from market_data import PublicRestClient
 from websocket_client import WebSocketClient, LiquidityDepthCalculator
 
+# Import metrics monitoring
+try:
+    from metrics_market import (
+        monitor_cycle_performance,
+        update_market_metrics,
+        update_websocket_metrics,
+        ACTIVE_MARKETS,
+        CONSECUTIVE_FAILURES,
+        monitor_api_call
+    )
+    METRICS_ENABLED = True
+except ImportError:
+    logger.warning("Metrics module not available - monitoring disabled")
+    METRICS_ENABLED = False
+    # Create dummy decorators if metrics not available
+    def monitor_cycle_performance(func):
+        return func
+    def monitor_api_call(endpoint):
+        def decorator(func):
+            return func
+        return decorator
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +115,7 @@ class SingleMarketMonitor:
                 logger.error(f"❌ Error in {self.market} monitoring: {e}")
                 await asyncio.sleep(1)  # Brief pause on error
 
+    @monitor_cycle_performance
     async def _monitor_cycle(self) -> bool:
         try:
             # Step 1: Get market data from shared data (no individual REST call)
@@ -117,7 +140,12 @@ class SingleMarketMonitor:
                 'timestamp': datetime.now(timezone.utc)
             }
 
-            # Step 4: Store in database
+            # Step 4: Update metrics if enabled
+            if METRICS_ENABLED:
+                update_market_metrics(self.market, market_data, orderbook_data)
+                update_websocket_metrics(self.market, self.orderbook_client)
+
+            # Step 5: Store in database
             success = self.db.insert_market_metrics(combined_metrics)
             if success:
                 price = market_data.get('mark_price', 0)
@@ -238,26 +266,37 @@ class MultiMarketMonitor:
         """Extract market data for specific coin from shared data."""
         if not self.shared_market_data:
             return None
-        return self.public_rest_client._extract_coin_data(self.shared_market_data, coin)
+            
+        try:
+            # Extract data for this specific coin
+            asset_ctx = next(
+                (ctx for ctx in self.shared_market_data[0] 
+                 if ctx.get('coin') == coin),
+                None
+            )
+            
+            if not asset_ctx:
+                logger.debug(f"{coin}: No data in shared cache")
+                return None
+                
+            return self.public_rest_client._extract_coin_data(coin)
+            
+        except Exception as e:
+            logger.error(f"Error extracting {coin} from shared data: {e}")
+            return None
 
     async def start(self):
-        """Start monitoring all configured markets."""
-        logger.info(f"Markets: {', '.join(self.config.target_markets)}")
+        """Start monitoring for all configured markets."""
+        logger.info(f"🚀 Starting monitoring for {len(self.config.target_markets)} markets...")
+        for market in self.config.target_markets:
+            await self.add_market(market)
 
-        try:
-            # Start monitoring tasks for all markets
-            await self._start_market_monitors()
-            
-            # Start shared data fetching loop
-            asyncio.create_task(self._shared_data_loop())
+        # Update active markets metric if enabled
+        if METRICS_ENABLED:
+            ACTIVE_MARKETS.set(len(self.market_tasks))
 
-            # Wait for shutdown
-            await self.shutdown_event.wait()
-
-        except Exception as e:
-            logger.error(f"Error in monitoring: {e}")
-        finally:
-            await self.stop()
+        logger.info(f"✅ All {len(self.market_tasks)} market monitors started")
+        return True
 
     async def _shared_data_loop(self):
         """Fetch shared market data every monitoring interval."""
