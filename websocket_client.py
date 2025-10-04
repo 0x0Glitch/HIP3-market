@@ -541,3 +541,58 @@ class LiquidityDepthCalculator:
                     result["ask_depth_25pct"] = pct_data["ask_depth"]
 
         return result
+
+    # Optimized cycle methods for efficient subscribe/unsubscribe pattern
+    async def _subscribe_l4_book(self) -> bool:
+        """Subscribe to L4 orderbook. Returns True on success."""
+        if not self.ws or not self._is_ws_open():
+            return False
+            
+        try:
+            # Clear any cached data to ensure fresh snapshot
+            self._current_snapshot = None
+            self._snapshot_time = None
+            
+            subscribe_msg = {
+                "method": "subscribe",
+                "subscription": {
+                    "type": "l4Book", 
+                    "coin": self.coin
+                }
+            }
+            await self.ws.send(json.dumps(subscribe_msg))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to subscribe to {self.coin}: {e}")
+            return False
+    
+    async def _wait_for_snapshot(self, timeout: float = 3.0) -> Optional[Dict]:
+        """Wait for orderbook snapshot after subscription."""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            if self._current_snapshot and self._snapshot_time:
+                return self._current_snapshot
+            await asyncio.sleep(0.05)  # Check every 50ms
+            
+        logger.warning(f"Timeout waiting for {self.coin} snapshot")
+        return None
+    
+    async def _unsubscribe_l4_book(self) -> bool:
+        """Unsubscribe from L4 orderbook. Returns True on success."""
+        if not self.ws or not self._is_ws_open():
+            return False
+            
+        try:
+            unsubscribe_msg = {
+                "method": "unsubscribe",
+                "subscription": {
+                    "type": "l4Book",
+                    "coin": self.coin
+                }
+            }
+            await self.ws.send(json.dumps(unsubscribe_msg))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unsubscribe from {self.coin}: {e}")
+            return False

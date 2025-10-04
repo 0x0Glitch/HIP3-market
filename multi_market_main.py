@@ -1,19 +1,18 @@
 """
 Multi-Market Monitoring System with WebSocket Client
-Supports concurrent monitoring of multiple markets with hot-reloading.
 """
 import asyncio
 import logging
 import signal
 import sys
 import time
+import aiohttp
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Set
-import traceback
+from typing import Dict, Any, Optional
 
 from config import Config
 from database import Database
-from market_data import PublicWebSocketClient
+from market_data import PublicRestClient
 from websocket_client import WebSocketClient, LiquidityDepthCalculator
 
 # Configure logging
@@ -25,14 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 class SingleMarketMonitor:
-    """Monitor for a single market with proper cleanup."""
+    """Monitor for a single market."""
 
-    def __init__(self, market: str, config: Config, db: Database, public_ws_client: PublicWebSocketClient):
+    def __init__(self, market: str, config: Config, db: Database, parent_monitor):
         self.market = market
         self.config = config
         self.db = db
+        self.parent_monitor = parent_monitor  # Reference to MultiMarketMonitor for shared data
         self.running = True
-        self.public_ws_client = public_ws_client  # Shared WebSocket client for all markets
         self.orderbook_client = WebSocketClient(
             config.ORDERBOOK_WS_URL,
             market,
@@ -42,10 +41,8 @@ class SingleMarketMonitor:
         self.max_data_age = config.MONITORING_INTERVAL / 2.0
 
     async def setup(self):
-        """Setup the single market monitor."""
         logger.info(f"🔧 Setting up monitor for {self.market}")
 
-        # Ensure table exists
         try:
             success = self.db.ensure_market_table(self.market)
             if not success:
@@ -97,31 +94,22 @@ class SingleMarketMonitor:
                 await asyncio.sleep(1)  # Brief pause on error
 
     async def _monitor_cycle(self) -> bool:
-        """Single monitoring cycle for this market - REST API with fresh data."""
         try:
-            # 📊 Get market data - REST API automatically fetches fresh data every second
-            market_data = self.public_ws_client.get_market_data(self.market)
+            # Step 1: Get market data from shared data (no individual REST call)
+            market_data = self.parent_monitor.get_market_data_from_shared(self.market)
             
             if not market_data:
-                # If cache is stale (>3s), make immediate fresh REST call
-                logger.debug(f"{self.market}: Cache stale, making fresh REST call...")
-                market_data = await self.public_ws_client.get_fresh_market_data(self.market)
-                
-                if not market_data:
-                    logger.warning(f"{self.market}: No market data available from REST API")
-                    return False
+                logger.warning(f"{self.market}: No market data from shared cache")
+                return False
 
-            # 📈 FORCE fresh orderbook data by resubscribing EVERY cycle (no caching)
-            logger.debug(f"{self.market}: Force resubscribing for fresh orderbook snapshot...")
+            # Step 2: Force fresh orderbook data by resubscribing (proven approach)
             orderbook_data = await self.orderbook_client.get_fresh_metrics()
             
             if not orderbook_data or orderbook_data.get("orderbook") is None:
-                logger.warning(f"{self.market}: Failed to get fresh orderbook snapshot - skipping cycle")
+                logger.warning(f"{self.market}: Failed to get fresh orderbook snapshot")
                 return False
-            
-            data_source = "FRESH"
 
-            # Combine data - fresh when possible, cached as fallback
+            # Step 3: Combine data
             combined_metrics = {
                 'coin': self.market,
                 **market_data,
@@ -129,13 +117,11 @@ class SingleMarketMonitor:
                 'timestamp': datetime.now(timezone.utc)
             }
 
-            # Insert into database
+            # Step 4: Store in database
             success = self.db.insert_market_metrics(combined_metrics)
             if success:
                 price = market_data.get('mark_price', 0)
-                # Show data age for REST API and orderbook freshness
-                pub_age = time.time() - self.public_ws_client._last_update_time if self.public_ws_client._last_update_time else 999
-                logger.info(f"📊 {self.market}: ${price:.4f} - REST({pub_age:.1f}s)+RESUBSCRIBED data inserted ✅")
+                logger.info(f"📊 {self.market}: ${price:.4f} - SHARED_DATA+FRESH_L4 ✅")
             else:
                 logger.error(f"❌ {self.market}: Failed to insert metrics")
                 return False
@@ -151,6 +137,7 @@ class SingleMarketMonitor:
         try:
             await asyncio.sleep(duration)
         except asyncio.CancelledError:
+            logger.info(f"Sleep for {self.market} interrupted")
             raise
 
     async def stop(self):
@@ -165,7 +152,6 @@ class SingleMarketMonitor:
 
 
 class MultiMarketMonitor:
-    """Manages multiple market monitors with hot-reload support."""
 
     def __init__(self):
         self.config = Config()
@@ -179,22 +165,20 @@ class MultiMarketMonitor:
         self.market_tasks: Dict[str, asyncio.Task] = {}
         self.market_monitors: Dict[str, SingleMarketMonitor] = {}
 
-        # Shared public REST API client for all markets (batched fetching)
-        self.public_ws_client = PublicWebSocketClient(
-            ws_url="wss://api.hyperliquid.xyz/ws",  # Not used (kept for compatibility)
-            poll_interval_s=1.0,  # Poll every 1 second for fresh data via REST
-            timeout_s=5.0,
-            request_delay_s=self.config.API_REQUEST_DELAY  # Not used in REST mode
-        )
+        # Shared REST API client for all markets
+        self.public_rest_client = PublicRestClient(timeout_s=5.0)
+        
+        # Shared market data - updated once per cycle for all markets
+        self.shared_market_data = None
+        self.shared_data_lock = asyncio.Lock()
 
     async def setup(self):
         """Initialize the multi-market monitor."""
-        logger.info("🚀 Setting up Multi-Market Monitor...")
         logger.info(f"Target Markets: {', '.join(self.config.target_markets)}")
 
         # Connect to public REST API (shared for all markets)
         try:
-            api_success = await self.public_ws_client.connect()
+            api_success = await self.public_rest_client.connect()
             if not api_success:
                 logger.error("Failed to connect to Hyperliquid REST API")
                 return False
@@ -226,48 +210,73 @@ class MultiMarketMonitor:
         logger.info("✅ Multi-Market Monitor setup completed")
         return True
 
+    async def fetch_shared_market_data(self) -> bool:
+        """Fetch metaAndAssetCtxs once for all markets to avoid 429 rate limiting."""
+        try:
+            # Make one REST call for all markets
+            payload = {"type": "metaAndAssetCtxs"}
+            
+            async with self.public_rest_client.session.post(
+                self.public_rest_client.api_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.public_rest_client.timeout_s)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    async with self.shared_data_lock:
+                        self.shared_market_data = data
+                    return True
+                else:
+                    logger.error(f"REST API error: {response.status}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error fetching shared market data: {e}")
+            return False
+
+    def get_market_data_from_shared(self, coin: str) -> Optional[Dict[str, Any]]:
+        """Extract market data for specific coin from shared data."""
+        if not self.shared_market_data:
+            return None
+        return self.public_rest_client._extract_coin_data(self.shared_market_data, coin)
+
     async def start(self):
         """Start monitoring all configured markets."""
-        logger.info("=" * 80)
-        logger.info("🎯 STARTING MULTI-MARKET MONITORING")
         logger.info(f"Markets: {', '.join(self.config.target_markets)}")
-        logger.info(f"Monitoring Interval: {self.config.MONITORING_INTERVAL}s")
-        logger.info("=" * 80)
 
         try:
             # Start monitoring tasks for all markets
             await self._start_market_monitors()
-
-            # Start hot-reload task
-            hot_reload_task = asyncio.create_task(
-                self._hot_reload_task(),
-                name="hot_reload"
-            )
+            
+            # Start shared data fetching loop
+            asyncio.create_task(self._shared_data_loop())
 
             # Wait for shutdown
-            all_tasks = list(self.market_tasks.values()) + [hot_reload_task]
-
-            # Wait for either shutdown event or task completion
-            done, pending = await asyncio.wait(
-                all_tasks + [asyncio.create_task(self.shutdown_event.wait())],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # Cancel remaining tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            await self.shutdown_event.wait()
 
         except Exception as e:
-            logger.error(f"💥 Error in monitoring: {e}")
+            logger.error(f"Error in monitoring: {e}")
         finally:
             await self.stop()
 
+    async def _shared_data_loop(self):
+        """Fetch shared market data every monitoring interval."""
+        while self.running:
+            try:
+                success = await self.fetch_shared_market_data()
+                if success:
+                    logger.debug("✅ Shared market data updated")
+                else:
+                    logger.warning("⚠️ Failed to fetch shared market data")
+                
+                # Wait for monitoring interval before next fetch
+                await asyncio.sleep(self.config.MONITORING_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"Error in shared data loop: {e}")
+                await asyncio.sleep(1)
+
     async def _start_market_monitors(self):
-        """Start monitoring tasks for all configured markets."""
         for market in self.config.target_markets:
             try:
                 await self._add_market_monitor(market)
@@ -275,16 +284,12 @@ class MultiMarketMonitor:
                 logger.error(f"Failed to start monitor for {market}: {e}")
 
     async def _add_market_monitor(self, market: str):
-        """Add a new market monitor."""
         if market in self.market_monitors:
             logger.warning(f"Monitor for {market} already exists")
             return
 
-        logger.info(f"🔄 Adding monitor for {market}")
-
         try:
-            # Create monitor with shared public WebSocket client
-            monitor = SingleMarketMonitor(market, self.config, self.db, self.public_ws_client)
+            monitor = SingleMarketMonitor(market, self.config, self.db, self)
             setup_success = await monitor.setup()
 
             if not setup_success:
@@ -301,65 +306,6 @@ class MultiMarketMonitor:
 
         except Exception as e:
             logger.error(f"Error adding monitor for {market}: {e}")
-
-    async def _remove_market_monitor(self, market: str):
-        """Remove a market monitor."""
-        if market not in self.market_monitors:
-            return
-
-        logger.info(f"🗑️ Removing monitor for {market}")
-
-        try:
-            # Cancel task
-            if market in self.market_tasks:
-                self.market_tasks[market].cancel()
-                try:
-                    await self.market_tasks[market]
-                except asyncio.CancelledError:
-                    pass
-                del self.market_tasks[market]
-
-            # Stop monitor
-            if market in self.market_monitors:
-                await self.market_monitors[market].stop()
-                del self.market_monitors[market]
-
-            logger.info(f"🛑 Stopped monitoring {market}")
-
-        except Exception as e:
-            logger.error(f"Error removing {market} monitor: {e}")
-
-    async def _hot_reload_task(self):
-        """Hot-reload task to detect market changes."""
-        logger.info("🔥 Hot-reload task started")
-
-        while self.running:
-            try:
-                await asyncio.sleep(10)  # Check every 10 seconds
-
-                if not self.running:
-                    break
-
-                # Check for market changes
-                added_markets = self.config.reload_markets()
-                current_markets = set(self.config.target_markets)
-                existing_markets = set(self.market_monitors.keys())
-
-                # Add new markets
-                for market in added_markets:
-                    await self._add_market_monitor(market)
-
-                # Remove markets that are no longer configured
-                removed_markets = existing_markets - current_markets
-                for market in removed_markets:
-                    await self._remove_market_monitor(market)
-
-            except asyncio.CancelledError:
-                logger.info("Hot-reload task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Hot-reload error: {e}")
-                await asyncio.sleep(5)
 
     async def stop(self):
         """Stop all monitoring gracefully."""
@@ -391,7 +337,7 @@ class MultiMarketMonitor:
 
         # Disconnect public REST API
         try:
-            await self.public_ws_client.disconnect()
+            await self.public_rest_client.disconnect()
             logger.info("Hyperliquid REST API disconnected")
         except Exception as e:
             logger.error(f"Error disconnecting REST API: {e}")
@@ -412,7 +358,6 @@ class MultiMarketMonitor:
 
 
 async def main():
-    """Main entry point with robust error handling."""
     monitor = None
 
     try:
@@ -441,39 +386,25 @@ async def main():
         return 0
     except Exception as e:
         logger.error(f"Critical error: {e}")
-        logger.error(traceback.format_exc())
         return 1
     finally:
         if monitor:
             try:
                 await monitor.stop()
             except Exception as e:
-                logger.error(f"Error in final cleanup: {e}")
+                logger.error(f"Error in cleanup: {e}")
 
 
 if __name__ == "__main__":
     try:
-        logger.info("=== Multi-Market Monitoring System ===")
-        config = Config()
-        logger.info(f"Version: 2.0.0")
-        logger.info(f"Markets: {', '.join(config.target_markets)}")
-        logger.info(f"Monitoring interval: {config.MONITORING_INTERVAL:.1f} seconds")
-        logger.info(f"API request delay: {config.API_REQUEST_DELAY:.1f} seconds")
-        logger.info(f"Database: {config.database_url}")
-        logger.info("")
-        logger.info("Press Ctrl+C to stop gracefully")
-        logger.info("System supports hot-reloading - edit .env to add markets")
-        logger.info("=" * 60)
-
         exit_code = asyncio.run(main())
         sys.exit(exit_code)
 
     except KeyboardInterrupt:
-        logger.info("\n🛑 Monitoring system stopped by user (Ctrl+C)")
+        logger.info("Stopped by user")
         sys.exit(0)
     except Exception as e:
-        logger.error(f"\n💥 Fatal error: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Fatal error: {e}")
         sys.exit(1)
     finally:
         logger.info("Multi-Market monitoring system shutdown complete.")
