@@ -47,10 +47,10 @@ def get_table_schema(coin_symbol: str) -> str:
         created_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(timestamp, coin)
     );
-    
-    CREATE INDEX IF NOT EXISTS idx_{coin_symbol.lower()}_metrics_timestamp 
+
+    CREATE INDEX IF NOT EXISTS idx_{coin_symbol.lower()}_metrics_timestamp
         ON market_metrics.{table_name}(timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_{coin_symbol.lower()}_metrics_coin_timestamp 
+    CREATE INDEX IF NOT EXISTS idx_{coin_symbol.lower()}_metrics_coin_timestamp
         ON market_metrics.{table_name}(coin, timestamp DESC);
     """
 
@@ -106,14 +106,14 @@ class Database:
                 logger.info("Schema 'market_metrics' created/verified")
         finally:
             self.pool.putconn(conn)
-    
+
     def ensure_market_table(self, coin_symbol: str) -> bool:
         """Ensure table exists for a specific market."""
         table_name = f"{coin_symbol.lower()}_metrics_raw"
-        
+
         if table_name in self.created_tables:
             return True
-            
+
         conn = self.pool.getconn()
         try:
             conn.autocommit = True
@@ -128,7 +128,7 @@ class Database:
             return False
         finally:
             self.pool.putconn(conn)
-    
+
     def ensure_market_tables(self, coin_symbols: List[str]) -> bool:
         """Ensure tables exist for all specified markets."""
         success = True
@@ -136,7 +136,7 @@ class Database:
             if not self.ensure_market_table(coin_symbol):
                 success = False
         return success
-    
+
     def is_connected(self) -> bool:
         """Check if database pool is available."""
         if not self.pool:
@@ -173,7 +173,7 @@ class Database:
 
         # Use market-specific table
         table_name = f"{coin_symbol.lower()}_metrics_raw"
-        
+
         query = f"""
             INSERT INTO market_metrics.{table_name} (
                 coin, mark_price, oracle_price, mid_price,
